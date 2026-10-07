@@ -373,6 +373,64 @@ xla_group.add_argument(
     help="To use the XLA devices with SPMD/FSDPv2 for everything.",
 )
 
+# Eager mode is a MODIFIER of the selected XLA backend, not a competing
+# backend, so these flags deliberately live OUTSIDE `xla_group` (which is
+# mutually exclusive) — `--xla --xla_eager` must remain expressible.
+#
+# Producer half of a previously half-landed feature: `comfy/model_management.py`
+# consumed `args.xla_eager` / `args.xla_eager_compile` at import time while no
+# argparse entry existed, so *every* platform (CPU, CUDA, XLA) crashed with
+# `AttributeError: 'Namespace' object has no attribute 'xla_eager'` before this
+# group was added. Declaring them here restores the missing producer.
+parser.add_argument(
+    "--xla_eager",
+    action="store_true",
+    help="Enable XLA eager mode (only ops wrapped in torch_xla.compile are compiled; the rest run eagerly). Requires --xla or --xla_spmd.",
+)
+parser.add_argument(
+    "--xla_eager_compile",
+    action="store_true",
+    help="Alias flag for --xla_eager, kept for forward compatibility with callers that set it separately.",
+)
+
+parser.add_argument(
+    "--xla_cache_path",
+    type=str,
+    default=None,
+    help=(
+        "Directory for the XLA persistent compilation cache. Overrides the "
+        "XLA_COMFY_CACHE_PATH environment variable. Default: /tmp (matches "
+        "upstream behaviour). On hosts where /tmp is a scarce copy-on-write "
+        "overlay (e.g. Kaggle), point this at a RAM-backed tmpfs such as "
+        "/dev/shm/xla_comfy_cache."
+    ),
+)
+
+parser.add_argument(
+    "--xla_spmd_mem_divisor",
+    type=float,
+    default=3.0,
+    help=(
+        "Divisor applied to SPMD-reported chip memory before ComfyUI plans "
+        "model placement. The stock value 3.0 reproduces the fork's original "
+        "TPU v3-8 measurement (only 3/8 of HBM usable under SPMD). Chip types "
+        "with a different usable-HBM ratio MUST be calibrated here; e.g. "
+        "1.0 to treat the full reported HBM as usable. Measured at "
+        "get_xla_memory_info() in comfy/model_management.py."
+    ),
+)
+
+parser.add_argument(
+    "--xla_mesh",
+    type=str,
+    default=None,
+    help=(
+        "SPMD mesh shape as comma-separated integers, e.g. '2,4' for a 2x4 "
+        "TPU v5e-8 slice. Defaults to the flat '(num_devices, 1)' mesh the "
+        "fork has always used. The mesh axis names stay ('fsdp', 'model')."
+    ),
+)
+
 # The default built-in provider hosted under web/
 DEFAULT_VERSION_STRING = "comfyanonymous/ComfyUI@latest"
 
