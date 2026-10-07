@@ -54,6 +54,7 @@ class CPUState(Enum):
     GPU = 0
     CPU = 1
     MPS = 2
+    XLA = 3
 
 # Determine VRAM State
 vram_state = VRAMState.NORMAL_VRAM
@@ -155,8 +156,214 @@ try:
 except:
     ixuca_available = False
 
+def _xla_mesh_shape(mesh_spec, num_devices):
+    """Resolve the SPMD mesh shape and axis names for an XLA run.
+
+    The fork's historical mesh is flat: ``(num_devices, 1)`` over the axis
+    names ``("fsdp", "model")``. That works on a 1-D slice but discards the
+    real interconnect topology on a 2-D host — a Kaggle v5e-8 slice is 2x4 per
+    ``TPU_CHIPS_PER_HOST_BOUNDS=2,4,1``. ``--xla_mesh`` lets the operator
+    declare the true shape (e.g. ``"2,4"``); ``None`` or an unusable spec
+    falls back to the historical flat mesh, so the default path is unchanged.
+
+    The ``'fsdp'`` axis name is mandatory: XLA shards weights and activations
+    along it, so it is always placed first and any extra shape dimensions are
+    appended after it.
+
+    Args:
+        mesh_spec: comma-separated integers (``"2,4"``) or None.
+        num_devices: number of XLA devices actually visible at runtime.
+
+    Returns:
+        ``(shape_tuple, axis_names_tuple)``.
+    """
+    flat = ((num_devices, 1), ("fsdp", "model"))
+    if not mesh_spec:
+        return flat
+
+    try:
+        dims = [int(d) for d in str(mesh_spec).split(",") if d.strip() != ""]
+    except ValueError:
+        logging.warning(
+            "Could not parse --xla_mesh %r as integers; using flat %d,1 mesh.",
+            mesh_spec,
+            num_devices,
+        )
+        return flat
+
+    if not dims or any(d <= 0 for d in dims):
+        logging.warning(
+            "Invalid --xla_mesh %r (all dimensions must be positive); "
+            "using flat %d,1 mesh.",
+            mesh_spec,
+            num_devices,
+        )
+        return flat
+
+    cells = 1
+    for d in dims:
+        cells *= d
+    if cells != num_devices:
+        logging.warning(
+            "Requested --xla_mesh %r has %d cells but %d devices are visible; "
+            "using flat %d,1 mesh instead.",
+            mesh_spec,
+            cells,
+            num_devices,
+            num_devices,
+        )
+        return flat
+
+    return (tuple(dims), ("fsdp",) + tuple(f"mesh{i}" for i in range(len(dims))))
+
+
+try:
+    if args.xla or args.xla_spmd:
+        import torch_xla as xla
+        import torch_xla.core.xla_model as xm
+        from torch_xla import runtime as xr
+
+        # Persistent XLA compilation cache location.
+        #
+        # Was hardcoded to "/tmp", which is correct on a normal host but wrong
+        # on hosts where /tmp is a scarce copy-on-write overlay (Kaggle is
+        # exactly this: /, /tmp and /kaggle/temp all share one Docker overlay
+        # with a ~68 GiB COW store, while /dev/shm is a real 164 GiB tmpfs).
+        # Compile artefacts are large and read-heavy, so they belong on the
+        # RAM-backed tier.
+        #
+        # Precedence: XLA_COMFY_CACHE_PATH env > --xla_cache_path flag > "/tmp"
+        # (the historical default, preserved so the default path is unchanged).
+        #
+        # NOTE: torch_xla.runtime.initialize_cache() only sets the environment
+        # variables XLA_PERSISTENT_CACHE_PATH / XLA_PERSISTENT_CACHE_READ_ONLY;
+        # it does not create the directory.
+        _xla_cache_path = (
+            os.environ.get("XLA_COMFY_CACHE_PATH")
+            or getattr(args, "xla_cache_path", None) or "/tmp"
+        )
+        try:
+            os.makedirs(_xla_cache_path, exist_ok=True)
+        except OSError as _e:
+            logging.warning(
+                "Could not create XLA cache directory %s (%s); falling back to /tmp",
+                _xla_cache_path,
+                _e,
+            )
+            _xla_cache_path = "/tmp"
+            os.makedirs(_xla_cache_path, exist_ok=True)
+
+        xr.initialize_cache(_xla_cache_path)
+        logging.info("XLA compilation cache: %s", _xla_cache_path)
+
+        cpu_state = CPUState.XLA
+        logging.info("Using XLA")
+
+    if args.xla_spmd:
+        import numpy as np
+        import torch_xla.distributed.spmd as xs
+
+        xr.use_spmd()
+
+        logging.info("Using XLA SPMD")
+
+        num_devices = xr.global_runtime_device_count()
+        mesh_shape, mesh_axis_names = _xla_mesh_shape(getattr(args, "xla_mesh", None), num_devices)
+        device_ids = np.array(range(num_devices))
+        # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
+        mesh = xs.Mesh(device_ids, mesh_shape, mesh_axis_names)
+        logging.info("XLA SPMD mesh: shape=%s axes=%s", mesh_shape, mesh_axis_names)
+        xs.set_global_mesh(mesh)
+
+    # getattr defaults (rather than bare attribute access) are deliberate:
+    # this flag pair was once consumed here with no argparse producer, which
+    # raised AttributeError at import time on EVERY platform. A missing
+    # optional flag must degrade to "disabled", never crash the process.
+    if getattr(args, "xla_eager", False) or getattr(args, "xla_eager_compile", False):
+        if not args.xla and not args.xla_spmd:
+            raise ValueError(
+                "XLA eager mode requires XLA or XLA SPMD mode to be enabled"
+            )
+        xla.experimental.eager_mode(True)
+        logging.info("Using XLA eager mode")
+
+
+except Exception as e:
+    raise e
+
+try:
+    if args.xla_spmd:
+        # tpu-info is needed to track TPUs memory usage when using SPMD/FSDP mode
+        from tpu_info import device
+        from tpu_info import metrics
+except ImportError:
+    raise ImportError(
+        "Please install tpu-info to use XLA SPMD mode, https://github.com/AI-Hypercomputer/cloud-accelerator-diagnostics/tree/main/tpu_info"
+    )
+
 if args.cpu:
     cpu_state = CPUState.CPU
+
+
+# Effective SPMD usable-memory divisor.
+#
+# The fork's original comment read: "Tested on TPU v3-8, given 8 cores, only
+# 3/8 of the memory is available in SPMD mode" and then applied a bare `/= 3`.
+# That constant is a v3 EMPIRICAL measurement, not a law of SPMD, and it is
+# the single number that drives every ComfyUI model-placement decision.
+# Silently re-tuning it here would be a claim without a measurement on this
+# host, so the divisor is exposed instead: the default preserves the original
+# behaviour exactly, and any other chip type is a one-flag calibration away.
+def _xla_spmd_mem_divisor():
+    divisor = getattr(args, "xla_spmd_mem_divisor", 3.0)
+    try:
+        divisor = float(divisor)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Invalid --xla_spmd_mem_divisor %r; falling back to 3.0", divisor
+        )
+        divisor = 3.0
+    if divisor <= 0:
+        logging.warning(
+            "--xla_spmd_mem_divisor must be > 0 (got %r); falling back to 3.0",
+            divisor,
+        )
+        divisor = 3.0
+    return divisor
+
+
+def get_xla_memory_info(dev):
+    if args.xla_spmd:
+        mem_reserved, mem_total = 0, 0
+
+        chip_type, count = device.get_local_chips()
+        if not chip_type or not count:
+            raise RuntimeError("No TPU devices found.")
+
+        device_usage = metrics.get_chip_usage(chip_type)
+        for chip in device_usage:
+            mem_reserved += chip.memory_usage
+            mem_total += chip.total_memory
+
+        divisor = _xla_spmd_mem_divisor()
+        logging.info(
+            "SPMD memory: chip_type=%s chips=%s raw_total=%.2fGiB divisor=%.3f "
+            "-> usable_total=%.2fGiB (calibrate with --xla_spmd_mem_divisor)",
+            chip_type,
+            count,
+            mem_total / (1024**3),
+            divisor,
+            (mem_total / divisor) / (1024**3),
+        )
+        mem_reserved /= divisor
+        mem_total /= divisor
+    else:
+        # xm.get_memory_info(dev) only has bytes_limit and bytes_used
+        mem_info = xm.get_memory_info(dev)
+        mem_reserved = mem_info["bytes_used"]
+        mem_total = mem_info["bytes_limit"]
+    return (mem_reserved, mem_total)
+
 
 def is_intel_xpu():
     global cpu_state
@@ -202,6 +409,8 @@ def get_torch_device():
         return torch.device("mps")
     if cpu_state == CPUState.CPU:
         return torch.device("cpu")
+    if cpu_state == CPUState.XLA:
+        return xla.device()
     else:
         if is_intel_xpu():
             return torch.device("xpu", torch.xpu.current_device())
@@ -325,6 +534,8 @@ def get_total_memory(dev=None, torch_total_too=False):
         if directml_enabled:
             mem_total = 1024 * 1024 * 1024 #TODO
             mem_total_torch = mem_total
+        elif cpu_state == CPUState.XLA:
+            mem_total_torch, mem_total = get_xla_memory_info(dev)
         elif is_intel_xpu():
             stats = torch.xpu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
@@ -588,7 +799,7 @@ if lowvram_available:
         vram_state = set_vram_to
 
 
-if cpu_state != CPUState.GPU:
+if cpu_state != CPUState.GPU and cpu_state != CPUState.XLA:
     vram_state = VRAMState.DISABLED
 
 if cpu_state == CPUState.MPS:
@@ -1820,6 +2031,10 @@ def get_free_memory(dev=None, torch_free_too=False):
         if directml_enabled:
             mem_free_total = 1024 * 1024 * 1024 #TODO
             mem_free_torch = mem_free_total
+        elif cpu_state == CPUState.XLA:
+            mem_reserved, mem_total = get_xla_memory_info(dev)
+            mem_free_total = mem_total - mem_reserved
+            mem_free_torch = mem_free_total
         elif is_intel_xpu():
             stats = torch.xpu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
@@ -1853,6 +2068,10 @@ def get_free_memory(dev=None, torch_free_too=False):
         return (mem_free_total, mem_free_torch)
     else:
         return mem_free_total
+
+def xla_mode():
+    global cpu_state
+    return cpu_state == CPUState.XLA
 
 def cpu_mode():
     global cpu_state
@@ -1915,6 +2134,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
         return True
 
     if cpu_mode():
+        return False
+
+    if xla_mode():
         return False
 
     if is_intel_xpu():
@@ -1983,6 +2205,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     if cpu_mode():
         return False
 
+    if xla_mode():
+        return True
+
     if is_intel_xpu():
         return torch.xpu.is_bf16_supported()
 
@@ -2018,6 +2243,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     return False
 
 def supports_fp8_compute(device=None):
+    if xla_mode():
+        return True
+
     if SUPPORT_FP8_OPS:
         return True
 
