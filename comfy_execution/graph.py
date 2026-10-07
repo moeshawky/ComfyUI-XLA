@@ -1,6 +1,15 @@
-import nodes
+from typing import Type, Literal
 
-from comfy_execution.graph_utils import is_link
+import nodes
+import asyncio
+import inspect
+from comfy_execution.graph_utils import is_link, ExecutionBlocker
+from comfy.comfy_types.node_typing import ComfyNodeABC, InputTypeDict, InputTypeOptions
+from comfy_api.internal import _ComfyNodeInternal
+from comfy_api.latest import _io
+
+# NOTE: ExecutionBlocker code got moved to graph_utils.py to prevent torch being imported too soon during unit tests
+ExecutionBlocker = ExecutionBlocker
 
 class DependencyCycleError(Exception):
     pass
@@ -15,17 +24,26 @@ class DynamicPrompt:
     def __init__(self, original_prompt):
         # The original prompt provided by the user
         self.original_prompt = original_prompt
+        # Runtime replacements for original nodes, without mutating the submitted prompt.
+        self.node_overrides = {}
         # Any extra pieces of the graph created during execution
         self.ephemeral_prompt = {}
         self.ephemeral_parents = {}
         self.ephemeral_display = {}
 
     def get_node(self, node_id):
+        if node_id in self.node_overrides:
+            return self.node_overrides[node_id]
         if node_id in self.ephemeral_prompt:
             return self.ephemeral_prompt[node_id]
         if node_id in self.original_prompt:
             return self.original_prompt[node_id]
         raise NodeNotFoundError(f"Node {node_id} not found")
+
+    def override_node(self, node_id, node_info):
+        if not self.has_node(node_id):
+            raise NodeNotFoundError(f"Node {node_id} not found")
+        self.node_overrides[node_id] = node_info
 
     def has_node(self, node_id):
         return node_id in self.original_prompt or node_id in self.ephemeral_prompt
@@ -54,8 +72,23 @@ class DynamicPrompt:
     def get_original_prompt(self):
         return self.original_prompt
 
-def get_input_info(class_def, input_name):
-    valid_inputs = class_def.INPUT_TYPES()
+def get_input_info(
+    class_def: Type[ComfyNodeABC],
+    input_name: str,
+    valid_inputs: InputTypeDict | None = None
+) -> tuple[str, Literal["required", "optional", "hidden"], InputTypeOptions] | tuple[None, None, None]:
+    """Get the input type, category, and extra info for a given input name.
+
+    Arguments:
+        class_def: The class definition of the node.
+        input_name: The name of the input to get info for.
+        valid_inputs: The valid inputs for the node, or None to use the class_def.INPUT_TYPES().
+
+    Returns:
+        tuple[str, str, dict] | tuple[None, None, None]: The input type, category, and extra info for the input name.
+    """
+
+    valid_inputs = valid_inputs or class_def.INPUT_TYPES()
     input_info = None
     input_category = None
     if "required" in valid_inputs and input_name in valid_inputs["required"]:
@@ -74,6 +107,11 @@ def get_input_info(class_def, input_name):
         extra_info = input_info[1]
     else:
         extra_info = {}
+    # if input_type is a list, it is a Combo defined in outdated format; convert it.
+    # NOTE: uncomment this when we are confident old format going away won't cause too much trouble.
+    # if isinstance(input_type, list):
+    #     extra_info["options"] = input_type
+    #     input_type = IO.Combo.io_type
     return input_type, input_category, extra_info
 
 class TopologicalSort:
@@ -82,11 +120,17 @@ class TopologicalSort:
         self.pendingNodes = {}
         self.blockCount = {} # Number of nodes this node is directly blocked by
         self.blocking = {} # Which nodes are blocked by this node
+        self.externalBlocks = 0
+        self.externalBlockResults = {}
+        self.unblockedEvent = asyncio.Event()
 
     def get_input_info(self, unique_id, input_name):
-        class_type = self.dynprompt.get_node(unique_id)["class_type"]
-        class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-        return get_input_info(class_def, input_name)
+        node = self.dynprompt.get_node(unique_id)
+        class_def = nodes.NODE_CLASS_MAPPINGS[node["class_type"]]
+        valid_inputs = class_def.INPUT_TYPES()
+        if issubclass(class_def, _ComfyNodeInternal):
+            valid_inputs, _, _ = _io.get_finalized_class_inputs(valid_inputs, node["inputs"])
+        return get_input_info(class_def, input_name, valid_inputs)
 
     def make_input_strong_link(self, to_node_id, to_input):
         inputs = self.dynprompt.get_node(to_node_id)["inputs"]
@@ -126,14 +170,33 @@ class TopologicalSort:
                     from_node_id, from_socket = value
                     if subgraph_nodes is not None and from_node_id not in subgraph_nodes:
                         continue
-                    input_type, input_category, input_info = self.get_input_info(unique_id, input_name)
+                    _, _, input_info = self.get_input_info(unique_id, input_name)
                     is_lazy = input_info is not None and "lazy" in input_info and input_info["lazy"]
-                    if (include_lazy or not is_lazy) and not self.is_cached(from_node_id):
-                        node_ids.append(from_node_id)
+                    if (include_lazy or not is_lazy):
+                        if not self.is_cached(from_node_id):
+                            node_ids.append(from_node_id)
                         links.append((from_node_id, from_socket, unique_id))
-                        
+
         for link in links:
             self.add_strong_link(*link)
+
+    def add_external_block(self, node_id):
+        assert node_id in self.blockCount, "Can't add external block to a node that isn't pending"
+        self.externalBlocks += 1
+        self.blockCount[node_id] += 1
+        def unblock(value=None):
+            self.release_external_block(node_id, value)
+        return unblock
+
+    def release_external_block(self, node_id, value=None):
+        self.externalBlocks -= 1
+        self.blockCount[node_id] -= 1
+        if value is not None:
+            self.externalBlockResults[node_id] = value
+        self.unblockedEvent.set()
+
+    def get_external_block_result(self, node_id):
+        return self.externalBlockResults.get(node_id)
 
     def is_cached(self, node_id):
         return False
@@ -146,6 +209,7 @@ class TopologicalSort:
         for blocked_node_id in self.blocking[unique_id]:
             self.blockCount[blocked_node_id] -= 1
         del self.blocking[unique_id]
+        self.externalBlockResults.pop(unique_id, None)
 
     def is_empty(self):
         return len(self.pendingNodes) == 0
@@ -155,19 +219,82 @@ class ExecutionList(TopologicalSort):
     ExecutionList implements a topological dissolve of the graph. After a node is staged for execution,
     it can still be returned to the graph after having further dependencies added.
     """
-    def __init__(self, dynprompt, output_cache):
+    def __init__(self, dynprompt, output_cache, output_link_callback=None):
         super().__init__(dynprompt)
         self.output_cache = output_cache
+        self.output_link_callback = output_link_callback
         self.staged_node_id = None
+        self.execution_cache = {}
+        self.execution_cache_listeners = {}
 
     def is_cached(self, node_id):
-        return self.output_cache.get(node_id) is not None
+        return self.output_cache.get_local(node_id) is not None
 
-    def stage_node_execution(self):
+    def cache_link(self, from_node_id, to_node_id, from_socket=None):
+        if to_node_id not in self.execution_cache:
+            self.execution_cache[to_node_id] = {}
+        value = self.output_cache.get_local(from_node_id)
+        self.execution_cache[to_node_id][from_node_id] = value
+        if from_node_id not in self.execution_cache_listeners:
+            self.execution_cache_listeners[from_node_id] = set()
+        self.execution_cache_listeners[from_node_id].add((to_node_id, from_socket))
+        if value is not None and from_socket is not None and self.output_link_callback is not None:
+            self.output_link_callback(value.outputs[from_socket])
+
+    def get_cache(self, from_node_id, to_node_id):
+        if to_node_id not in self.execution_cache:
+            return None
+        value = self.execution_cache[to_node_id].get(from_node_id)
+        if value is None:
+            return None
+        #Write back to the main cache on touch.
+        self.output_cache.set_local(from_node_id, value)
+        return value
+
+    def cache_update(self, node_id, value):
+        if node_id in self.execution_cache_listeners:
+            for to_node_id, from_socket in self.execution_cache_listeners[node_id]:
+                if to_node_id in self.execution_cache:
+                    self.execution_cache[to_node_id][node_id] = value
+                if from_socket is not None and self.output_link_callback is not None:
+                    self.output_link_callback(value.outputs[from_socket])
+
+    def add_strong_link(self, from_node_id, from_socket, to_node_id):
+        super().add_strong_link(from_node_id, from_socket, to_node_id)
+        self.cache_link(from_node_id, to_node_id, from_socket)
+
+    def inhibit_nodes(self, node_ids):
+        """Remove pending nodes selected by the currently executing control node."""
+        assert self.staged_node_id is not None, "Nodes may only be inhibited while a control node is staged"
+        node_ids = set(node_ids).intersection(self.pendingNodes)
+        assert self.staged_node_id not in node_ids, "A control node cannot inhibit itself"
+
+        for from_node_id, blocked_nodes in self.blocking.items():
+            if from_node_id not in node_ids:
+                for node_id in node_ids:
+                    blocked_nodes.pop(node_id, None)
+        for node_id in node_ids:
+            for blocked_node_id in self.blocking[node_id]:
+                if blocked_node_id not in node_ids:
+                    self.blockCount[blocked_node_id] -= 1
+            del self.pendingNodes[node_id]
+            del self.blockCount[node_id]
+            del self.blocking[node_id]
+            self.execution_cache.pop(node_id, None)
+            self.execution_cache_listeners.pop(node_id, None)
+        for listeners in self.execution_cache_listeners.values():
+            listeners.difference_update({listener for listener in listeners if listener[0] in node_ids})
+
+    async def stage_node_execution(self):
         assert self.staged_node_id is None
         if self.is_empty():
             return None, None, None
         available = self.get_ready_nodes()
+        while len(available) == 0 and self.externalBlocks > 0:
+            # Wait for an external block to be released
+            await self.unblockedEvent.wait()
+            self.unblockedEvent.clear()
+            available = self.get_ready_nodes()
         if len(available) == 0:
             cycled_nodes = self.get_nodes_in_cycle()
             # Because cycles composed entirely of static nodes are caught during initial validation,
@@ -203,8 +330,15 @@ class ExecutionList(TopologicalSort):
                 return True
             return False
 
+        # If an available node is async, do that first.
+        # This will execute the asynchronous function earlier, reducing the overall time.
+        def is_async(node_id):
+            class_type = self.dynprompt.get_node(node_id)["class_type"]
+            class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
+            return inspect.iscoroutinefunction(getattr(class_def, class_def.FUNCTION))
+
         for node_id in node_list:
-            if is_output(node_id):
+            if is_output(node_id) or is_async(node_id):
                 return node_id
 
         #This should handle the VAEDecode -> preview case
@@ -227,9 +361,15 @@ class ExecutionList(TopologicalSort):
         assert self.staged_node_id is not None
         self.staged_node_id = None
 
+    def is_staged_node_blocked(self):
+        assert self.staged_node_id is not None
+        return self.blockCount[self.staged_node_id] > 0
+
     def complete_node_execution(self):
         node_id = self.staged_node_id
         self.pop_node(node_id)
+        self.execution_cache.pop(node_id, None)
+        self.execution_cache_listeners.pop(node_id, None)
         self.staged_node_id = None
 
     def get_nodes_in_cycle(self):
@@ -250,21 +390,3 @@ class ExecutionList(TopologicalSort):
                 del blocked_by[node_id]
             to_remove = [node_id for node_id in blocked_by if len(blocked_by[node_id]) == 0]
         return list(blocked_by.keys())
-
-class ExecutionBlocker:
-    """
-    Return this from a node and any users will be blocked with the given error message.
-    If the message is None, execution will be blocked silently instead.
-    Generally, you should avoid using this functionality unless absolutely necessary. Whenever it's
-    possible, a lazy input will be more efficient and have a better user experience.
-    This functionality is useful in two cases:
-    1. You want to conditionally prevent an output node from executing. (Particularly a built-in node
-       like SaveImage. For your own output nodes, I would recommend just adding a BOOL input and using
-       lazy evaluation to let it conditionally disable itself.)
-    2. You have a node with multiple possible outputs, some of which are invalid and should not be used.
-       (I would recommend not making nodes like this in the future -- instead, make multiple nodes with
-       different outputs. Unfortunately, there are several popular existing nodes using this pattern.)
-    """
-    def __init__(self, message):
-        self.message = message
-

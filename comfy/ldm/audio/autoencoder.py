@@ -75,16 +75,10 @@ class SnakeBeta(nn.Module):
         return x
 
 def WNConv1d(*args, **kwargs):
-    try:
-        return torch.nn.utils.parametrizations.weight_norm(ops.Conv1d(*args, **kwargs))
-    except:
-        return torch.nn.utils.weight_norm(ops.Conv1d(*args, **kwargs)) #support pytorch 2.1 and older
+    return torch.nn.utils.parametrizations.weight_norm(ops.Conv1d(*args, **kwargs))
 
 def WNConvTranspose1d(*args, **kwargs):
-    try:
-        return torch.nn.utils.parametrizations.weight_norm(ops.ConvTranspose1d(*args, **kwargs))
-    except:
-        return torch.nn.utils.weight_norm(ops.ConvTranspose1d(*args, **kwargs)) #support pytorch 2.1 and older
+    return torch.nn.utils.parametrizations.weight_norm(ops.ConvTranspose1d(*args, **kwargs))
 
 def get_activation(activation: Literal["elu", "snake", "none"], antialias=False, channels=None) -> nn.Module:
     if activation == "elu":
@@ -163,7 +157,7 @@ class DecoderBlock(nn.Module):
         else:
             upsample_layer = WNConvTranspose1d(in_channels=in_channels,
                                out_channels=out_channels,
-                               kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2))
+                               kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2), output_padding=stride % 2)
 
         self.layers = nn.Sequential(
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
@@ -267,16 +261,20 @@ class AudioOobleckVAE(nn.Module):
                  use_snake=True,
                  antialias_activation=False,
                  use_nearest_upsample=False,
-                 final_tanh=False):
+                 final_tanh=False,
+                 sample_latent=True):
         super().__init__()
         self.encoder = OobleckEncoder(in_channels, channels, latent_dim * 2, c_mults, strides, use_snake, antialias_activation)
         self.decoder = OobleckDecoder(in_channels, channels, latent_dim, c_mults, strides, use_snake, antialias_activation,
                                       use_nearest_upsample=use_nearest_upsample, final_tanh=final_tanh)
         self.bottleneck = VAEBottleneck()
+        self.sample_latent = sample_latent
 
     def encode(self, x):
-        return self.bottleneck.encode(self.encoder(x))
+        encoded = self.encoder(x)
+        if not self.sample_latent:
+            return encoded.chunk(2, dim=1)[0]
+        return self.bottleneck.encode(encoded)
 
     def decode(self, x):
         return self.decoder(self.bottleneck.decode(x))
-

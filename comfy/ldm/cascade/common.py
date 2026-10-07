@@ -18,12 +18,13 @@
 
 import torch
 import torch.nn as nn
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
 import comfy.ops
 
 class OptimizedAttention(nn.Module):
     def __init__(self, c, nhead, dropout=0.0, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         self.heads = nhead
 
         self.to_q = operations.Linear(c, c, bias=True, dtype=dtype, device=device)
@@ -32,12 +33,13 @@ class OptimizedAttention(nn.Module):
 
         self.out_proj = operations.Linear(c, c, bias=True, dtype=dtype, device=device)
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, transformer_options={}):
         q = self.to_q(q)
         k = self.to_k(k)
         v = self.to_v(v)
 
-        out = optimized_attention(q, k, v, self.heads)
+        q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
+        out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
 
         return self.out_proj(out)
 
@@ -47,13 +49,13 @@ class Attention2D(nn.Module):
         self.attn = OptimizedAttention(c, nhead, dtype=dtype, device=device, operations=operations)
         # self.attn = nn.MultiheadAttention(c, nhead, dropout=dropout, bias=True, batch_first=True, dtype=dtype, device=device)
 
-    def forward(self, x, kv, self_attn=False):
+    def forward(self, x, kv, self_attn=False, transformer_options={}):
         orig_shape = x.shape
         x = x.view(x.size(0), x.size(1), -1).permute(0, 2, 1)  # Bx4xHxW -> Bx(HxW)x4
         if self_attn:
             kv = torch.cat([x, kv], dim=1)
         # x = self.attn(x, kv, kv, need_weights=False)[0]
-        x = self.attn(x, kv, kv)
+        x = self.attn(x, kv, kv, transformer_options=transformer_options)
         x = x.permute(0, 2, 1).view(*orig_shape)
         return x
 
@@ -114,9 +116,9 @@ class AttnBlock(nn.Module):
             operations.Linear(c_cond, c, dtype=dtype, device=device)
         )
 
-    def forward(self, x, kv):
+    def forward(self, x, kv, transformer_options={}):
         kv = self.kv_mapper(kv)
-        x = x + self.attention(self.norm(x), kv, self_attn=self.self_attn)
+        x = x + self.attention(self.norm(x), kv, self_attn=self.self_attn, transformer_options=transformer_options)
         return x
 
 

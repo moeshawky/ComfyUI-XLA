@@ -160,7 +160,6 @@ class ControlNet(nn.Module):
             if isinstance(self.num_classes, int):
                 self.label_emb = nn.Embedding(num_classes, time_embed_dim)
             elif self.num_classes == "continuous":
-                print("setting up linear c_adm embedding layer")
                 self.label_emb = nn.Linear(1, time_embed_dim)
             elif self.num_classes == "sequential":
                 assert adm_in_channels is not None
@@ -414,7 +413,8 @@ class ControlNet(nn.Module):
         out_middle = []
 
         if self.num_classes is not None:
-            assert y.shape[0] == x.shape[0]
+            if y is None:
+                raise ValueError("y is None, did you try using a controlnet for SDXL on SD1?")
             emb = emb + self.label_emb(y)
 
         h = x

@@ -4,16 +4,17 @@ import pytest
 import os
 import tempfile
 from unittest.mock import patch
+from importlib import reload
 
 import folder_paths
+import comfy.cli_args
+
 
 @pytest.fixture()
 def clear_folder_paths():
-    # Clear the global dictionary before each test to ensure isolation
-    original = folder_paths.folder_names_and_paths.copy()
-    folder_paths.folder_names_and_paths.clear()
+    # Reload the module after each test to ensure isolation
     yield
-    folder_paths.folder_names_and_paths = original
+    reload(folder_paths)
 
 @pytest.fixture
 def temp_dir():
@@ -21,7 +22,17 @@ def temp_dir():
         yield tmpdirname
 
 
-def test_get_directory_by_type():
+@pytest.fixture
+def set_base_dir(monkeypatch):
+    def _set_base_dir(base_dir):
+        monkeypatch.setattr(comfy.cli_args.args, "base_directory", base_dir)
+        reload(folder_paths)
+    yield _set_base_dir
+    monkeypatch.undo()
+    reload(folder_paths)
+
+
+def test_get_directory_by_type(clear_folder_paths):
     test_dir = "/test/dir"
     folder_paths.set_output_directory(test_dir)
     assert folder_paths.get_directory_by_type("output") == test_dir
@@ -35,8 +46,11 @@ def test_annotated_filepath():
 
 def test_get_annotated_filepath():
     default_dir = "/default/dir"
-    assert folder_paths.get_annotated_filepath("test.txt", default_dir) == os.path.join(default_dir, "test.txt")
-    assert folder_paths.get_annotated_filepath("test.txt [output]") == os.path.join(folder_paths.get_output_directory(), "test.txt")
+    # get_annotated_filepath now normalizes with os.path.abspath (part of the
+    # GHSA-779p traversal hardening), so compare against the normalized form —
+    # on Windows abspath also prepends the current drive letter.
+    assert folder_paths.get_annotated_filepath("test.txt", default_dir) == os.path.abspath(os.path.join(default_dir, "test.txt"))
+    assert folder_paths.get_annotated_filepath("test.txt [output]") == os.path.abspath(os.path.join(folder_paths.get_output_directory(), "test.txt"))
 
 def test_add_model_folder_path_append(clear_folder_paths):
     folder_paths.add_model_folder_path("test_folder", "/default/path", is_default=True)
@@ -96,3 +110,63 @@ def test_get_save_image_path(temp_dir):
         assert counter == 1
         assert subfolder == ""
         assert filename_prefix == "test"
+
+
+def test_base_path_changes(set_base_dir):
+    test_dir = os.path.abspath("/test/dir")
+    set_base_dir(test_dir)
+
+    assert folder_paths.base_path == test_dir
+    assert folder_paths.models_dir == os.path.join(test_dir, "models")
+    assert folder_paths.input_directory == os.path.join(test_dir, "input")
+    assert folder_paths.output_directory == os.path.join(test_dir, "output")
+    assert folder_paths.temp_directory == os.path.join(test_dir, "temp")
+    assert folder_paths.user_directory == os.path.join(test_dir, "user")
+
+    assert os.path.join(test_dir, "custom_nodes") in folder_paths.get_folder_paths("custom_nodes")
+
+    for name in ["checkpoints", "loras", "vae", "configs", "embeddings", "controlnet", "classifiers"]:
+        assert folder_paths.get_folder_paths(name)[0] == os.path.join(test_dir, "models", name)
+
+
+def test_base_path_change_clears_old(set_base_dir):
+    test_dir = os.path.abspath("/test/dir")
+    set_base_dir(test_dir)
+
+    assert len(folder_paths.get_folder_paths("custom_nodes")) == 1
+
+    single_model_paths = [
+        "checkpoints",
+        "loras",
+        "vae",
+        "configs",
+        "clip_vision",
+        "style_models",
+        "diffusers",
+        "vae_approx",
+        "gligen",
+        "upscale_models",
+        "embeddings",
+        "hypernetworks",
+        "photomaker",
+        "classifiers",
+    ]
+    for name in single_model_paths:
+        assert len(folder_paths.get_folder_paths(name)) == 1
+
+    for name in ["controlnet", "diffusion_models", "text_encoders"]:
+        assert len(folder_paths.get_folder_paths(name)) == 2
+
+
+def test_models_directory_cli_and_getters(temp_dir, monkeypatch):
+    try:
+        monkeypatch.setattr(comfy.cli_args.args, "models_directory", temp_dir)
+        reload(folder_paths)
+
+        assert folder_paths.models_dir == os.path.abspath(temp_dir)
+
+        with pytest.raises(Exception):
+            comfy.cli_args.is_valid_directory(os.path.join(temp_dir, "non_existent_folder_path"))
+    finally:
+        monkeypatch.undo()
+        reload(folder_paths)

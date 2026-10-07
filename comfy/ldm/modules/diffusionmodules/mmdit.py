@@ -4,7 +4,7 @@ from typing import Dict, Optional, List
 import numpy as np
 import torch
 import torch.nn as nn
-from ..attention import optimized_attention
+from ..attention import AttentionTensorContainer, ComfyAttention, optimized_attention
 from einops import rearrange, repeat
 from .util import timestep_embedding
 import comfy.ops
@@ -109,7 +109,7 @@ class PatchEmbed(nn.Module):
 def modulate(x, shift, scale):
     if shift is None:
         shift = torch.zeros_like(scale)
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return torch.addcmul(shift.unsqueeze(1), x, 1+ scale.unsqueeze(1))
 
 
 #################################################################################
@@ -211,17 +211,20 @@ class TimestepEmbedder(nn.Module):
     Embeds scalar timesteps into vector representations.
     """
 
-    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=None):
+    def __init__(self, hidden_size, frequency_embedding_size=256, output_size=None, dtype=None, device=None, operations=None, max_period=10000):
         super().__init__()
+        if output_size is None:
+            output_size = hidden_size
         self.mlp = nn.Sequential(
             operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
             nn.SiLU(),
-            operations.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device),
+            operations.Linear(hidden_size, output_size, bias=True, dtype=dtype, device=device),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self.max_period = max_period
 
     def forward(self, t, dtype, **kwargs):
-        t_freq = timestep_embedding(t, self.frequency_embedding_size).to(dtype)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size, max_period=self.max_period).to(dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -273,6 +276,7 @@ class SelfAttention(nn.Module):
         operations=None,
     ):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
@@ -312,8 +316,9 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.pre_attention(x)
+        q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
         x = optimized_attention(
-            q, k, v, heads=self.num_heads
+            q, k, v, heads=self.num_heads, preferred_attention=self.comfy_attention
         )
         x = self.post_attention(x)
         return x
@@ -321,7 +326,7 @@ class SelfAttention(nn.Module):
 
 class RMSNorm(torch.nn.Module):
     def __init__(
-        self, dim: int, elementwise_affine: bool = False, eps: float = 1e-6, device=None, dtype=None
+        self, dim: int, elementwise_affine: bool = False, eps: float = 1e-6, device=None, dtype=None, **kwargs
     ):
         """
         Initialize the RMSNorm normalization layer.
@@ -564,10 +569,7 @@ class DismantledBlock(nn.Module):
         assert not self.pre_only
         attn1 = self.attn.post_attention(attn)
         attn2 = self.attn2.post_attention(attn2)
-        out1 = gate_msa.unsqueeze(1) * attn1
-        out2 = gate_msa2.unsqueeze(1) * attn2
-        x = x + out1
-        x = x + out2
+        x = gate_cat(x, gate_msa, gate_msa2, attn1, attn2)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp)
         )
@@ -577,23 +579,31 @@ class DismantledBlock(nn.Module):
         assert not self.pre_only
         if self.x_block_self_attn:
             qkv, qkv2, intermediates = self.pre_attention_x(x, c)
-            attn, _ = optimized_attention(
+            qkv = tuple(AttentionTensorContainer(t) for t in qkv)
+            qkv2 = tuple(AttentionTensorContainer(t) for t in qkv2)
+            attn = optimized_attention(
                 qkv[0], qkv[1], qkv[2],
-                num_heads=self.attn.num_heads,
+                heads=self.attn.num_heads, preferred_attention=self.attn.comfy_attention,
             )
-            attn2, _ = optimized_attention(
+            attn2 = optimized_attention(
                 qkv2[0], qkv2[1], qkv2[2],
-                num_heads=self.attn2.num_heads,
+                heads=self.attn2.num_heads, preferred_attention=self.attn2.comfy_attention,
             )
             return self.post_attention_x(attn, attn2, *intermediates)
         else:
             qkv, intermediates = self.pre_attention(x, c)
+            qkv = tuple(AttentionTensorContainer(t) for t in qkv)
             attn = optimized_attention(
                 qkv[0], qkv[1], qkv[2],
-                heads=self.attn.num_heads,
+                heads=self.attn.num_heads, preferred_attention=self.attn.comfy_attention,
             )
             return self.post_attention(attn, *intermediates)
 
+def gate_cat(x, gate_msa, gate_msa2, attn1, attn2):
+    out1 = gate_msa.unsqueeze(1) * attn1
+    out2 = gate_msa2.unsqueeze(1) * attn2
+    x = torch.stack([x, out1, out2], dim=0).sum(dim=0)
+    return x
 
 def block_mixing(*args, use_checkpoint=True, **kwargs):
     if use_checkpoint:
@@ -604,7 +614,7 @@ def block_mixing(*args, use_checkpoint=True, **kwargs):
         return _block_mixing(*args, **kwargs)
 
 
-def _block_mixing(context, x, context_block, x_block, c):
+def _block_mixing(context, x, context_block, x_block, c, transformer_options={}):
     context_qkv, context_intermediates = context_block.pre_attention(context, c)
 
     if x_block.x_block_self_attn:
@@ -612,18 +622,19 @@ def _block_mixing(context, x, context_block, x_block, c):
     else:
         x_qkv, x_intermediates = x_block.pre_attention(x, c)
 
-    o = []
-    for t in range(3):
-        o.append(torch.cat((context_qkv[t], x_qkv[t]), dim=1))
-    qkv = tuple(o)
+    context_len = context_qkv[0].shape[1]
+    qkv = tuple(AttentionTensorContainer(torch.cat((context_qkv[t], x_qkv[t]), dim=1)) for t in range(3))
+    del context_qkv, x_qkv
 
     attn = optimized_attention(
         qkv[0], qkv[1], qkv[2],
         heads=x_block.attn.num_heads,
+        preferred_attention=x_block.attn.comfy_attention,
+        transformer_options=transformer_options,
     )
     context_attn, x_attn = (
-        attn[:, : context_qkv[0].shape[1]],
-        attn[:, context_qkv[0].shape[1] :],
+        attn[:, :context_len],
+        attn[:, context_len:],
     )
 
     if not context_block.pre_only:
@@ -632,9 +643,12 @@ def _block_mixing(context, x, context_block, x_block, c):
     else:
         context = None
     if x_block.x_block_self_attn:
+        x_qkv2 = tuple(AttentionTensorContainer(t) for t in x_qkv2)
         attn2 = optimized_attention(
                 x_qkv2[0], x_qkv2[1], x_qkv2[2],
                 heads=x_block.attn2.num_heads,
+                preferred_attention=x_block.attn2.comfy_attention,
+                transformer_options=transformer_options,
             )
         x = x_block.post_attention_x(x_attn, attn2, *x_intermediates)
     else:
@@ -702,6 +716,7 @@ class FinalLayer(nn.Module):
 class SelfAttentionContext(nn.Module):
     def __init__(self, dim, heads=8, dim_head=64, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         dim_head = dim // heads
         inner_dim = dim
 
@@ -715,7 +730,10 @@ class SelfAttentionContext(nn.Module):
     def forward(self, x):
         qkv = self.qkv(x)
         q, k, v = split_qkv(qkv, self.dim_head)
-        x = optimized_attention(q.reshape(q.shape[0], q.shape[1], -1), k, v, heads=self.heads)
+        q = AttentionTensorContainer(q.reshape(q.shape[0], q.shape[1], -1))
+        k, v = AttentionTensorContainer(k), AttentionTensorContainer(v)
+        del qkv
+        x = optimized_attention(q, k, v, heads=self.heads, preferred_attention=self.comfy_attention)
         return self.proj(x)
 
 class ContextProcessorBlock(nn.Module):
@@ -956,10 +974,10 @@ class MMDiT(nn.Module):
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     out = {}
-                    out["txt"], out["img"] = self.joint_blocks[i](args["txt"], args["img"], c=args["vec"])
+                    out["txt"], out["img"] = self.joint_blocks[i](args["txt"], args["img"], c=args["vec"], transformer_options=args["transformer_options"])
                     return out
 
-                out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": c_mod}, {"original_block": block_wrap})
+                out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": c_mod, "transformer_options": transformer_options}, {"original_block": block_wrap})
                 context = out["txt"]
                 x = out["img"]
             else:
@@ -968,6 +986,7 @@ class MMDiT(nn.Module):
                     x,
                     c=c_mod,
                     use_checkpoint=self.use_checkpoint,
+                    transformer_options=transformer_options,
                 )
             if control is not None:
                 control_o = control.get("output")
