@@ -76,16 +76,26 @@ def get_ancestral_step(sigma_from, sigma_to, eta=1.):
 
 
 def default_noise_sampler(x, seed=None):
+    # torch.Generator supports cpu/cuda only. Constructing one on an XLA device
+    # raises "XLA device type not an accelerator", which killed res_multistep at
+    # its first step on TPU. For non-CPU/CUDA devices, seed on CPU and move the
+    # drawn noise to x's device: same stream of numbers, no XLA generator needed.
+    device_safe = x.device.type in ("cpu", "cuda")
+
     if seed is not None:
         if x.device == torch.device("cpu"):
             seed += 1
 
-        generator = torch.Generator(device=x.device)
-        generator.manual_seed(seed)
-    else:
-        generator = None
+        if device_safe:
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(seed)
+            return lambda sigma, sigma_next: torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device, generator=generator)
 
-    return lambda sigma, sigma_next: torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device, generator=generator)
+        cpu_generator = torch.Generator(device="cpu")
+        cpu_generator.manual_seed(seed)
+        return lambda sigma, sigma_next: torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device="cpu", generator=cpu_generator).to(x.device)
+
+    return lambda sigma, sigma_next: torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device)
 
 
 class BatchedBrownianTree:

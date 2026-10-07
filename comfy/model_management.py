@@ -214,7 +214,13 @@ def _xla_mesh_shape(mesh_spec, num_devices):
         )
         return flat
 
-    return (tuple(dims), ("fsdp",) + tuple(f"mesh{i}" for i in range(len(dims))))
+    # One axis name per mesh dimension. The leading "fsdp" IS the first dimension's
+    # name, so only len(dims) - 1 more are needed. `range(len(dims))` produced one
+    # name too many and xs.Mesh rejected every multi-dimensional mesh at import with
+    # "Number of axis names (3) must match mesh dimensions (2)", which meant the
+    # documented 2x4 v5e-8 topology could not start at all -- only the flat (N,1)
+    # fallback (returned earlier, line 180) ever worked.
+    return (tuple(dims), ("fsdp",) + tuple(f"mesh{i}" for i in range(len(dims) - 1)))
 
 
 try:
@@ -340,10 +346,35 @@ def get_xla_memory_info(dev):
         if not chip_type or not count:
             raise RuntimeError("No TPU devices found.")
 
-        device_usage = metrics.get_chip_usage(chip_type)
-        for chip in device_usage:
-            mem_reserved += chip.memory_usage
-            mem_total += chip.total_memory
+        # The runtime metrics come from an external agent listening on 127.0.0.1:8431
+        # (tpu_info/metrics.py:521). Kaggle's image ships no such sidecar and no binary
+        # to start one, so the gRPC call fails with UNAVAILABLE and --xla_spmd died at
+        # IMPORT time, before a single weight could load. Same rule as the argparse
+        # flags above: a missing optional input must degrade, never crash.
+        #
+        # The fallback is not a guess: the chip enum carries its own HBM
+        # (device.get_local_chips() -> (TpuChip.V5E(hbm_gib=16, devices_per_chip=1), 8)),
+        # so the total is exact. It is still a DESCRIPTOR, not a live reading, and the
+        # log says so -- mem_reserved stays 0 because nothing is reserved yet at import.
+        try:
+            device_usage = metrics.get_chip_usage(chip_type)
+        except Exception as e:
+            logging.warning(
+                "TPU runtime metrics unavailable (%s: %s); falling back to the chip "
+                "descriptor for SPMD memory sizing. This is NOT a live reading.",
+                type(e).__name__, str(e)[:160],
+            )
+            device_usage = None
+        if device_usage is not None:
+            for chip in device_usage:
+                mem_reserved += chip.memory_usage
+                mem_total += chip.total_memory
+        else:
+            # TpuChip is an enum whose .value is an Info(name, hbm_gib,
+            # devices_per_chip) NamedTuple — the HBM figure lives on .value, not on
+            # the member. Probed, not guessed: dir(TpuChip) exposes only
+            # {Info, from_pci_device_id, name, value}.
+            mem_total = chip_type.value.hbm_gib * (1024 ** 3) * count
 
         divisor = _xla_spmd_mem_divisor()
         logging.info(

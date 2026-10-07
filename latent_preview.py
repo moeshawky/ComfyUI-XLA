@@ -135,7 +135,28 @@ def prepare_callback(model, steps, x0_output_dict=None):
     pbar = comfy.utils.ProgressBar(steps)
 
     if args.xla_spmd and not isinstance(model.model.diffusion_model, FSDPv2):
-        model.model.diffusion_model = FSDPv2(model.model.diffusion_model)
+        # FSDPv2 re-shards each parameter, and torch_xla 2.8's
+        # `_get_xla_sharding_spec()` raises
+        #   "Input tensor is not an XLA tensor: XLABFloat16Type"
+        # on parameters that ComfyUI's loader has not materialised as XLA
+        # tensors. Left unhandled this aborts every KSampler at the first step.
+        #
+        # The wrap is a MEMORY optimisation, not a correctness requirement: a
+        # single v5e chip carries 16 GiB HBM, so a 6.8 GiB int8 DiT fits
+        # unsharded. Degrade to single-chip execution with a loud log rather
+        # than take the sampler down. Sharding is the difference between
+        # "runs slower" and "does not run at all".
+        try:
+            model.model.diffusion_model = FSDPv2(model.model.diffusion_model)
+        except RuntimeError as e:
+            logging.warning(
+                "XLA SPMD: FSDPv2 wrap skipped (%s: %s). Continuing unsharded on a "
+                "single chip. Loss: no cross-chip weight sharding, so peak memory "
+                "is the whole model. If this was an HBM OOM, sharding is the fix "
+                "and this warning is why it did not happen.",
+                type(e).__name__,
+                str(e).strip().splitlines()[0] if str(e).strip() else "<no message>",
+            )
 
     def callback(step, x0, x, total_steps):
         if x0_output_dict is not None:
